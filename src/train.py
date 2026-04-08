@@ -1,28 +1,49 @@
 """
-Train TNM staging model: single encoder + three heads.
+Train TNM staging model: backbone encoder/decoder + three classification heads.
+Supports both CE (cross-entropy) and CORAL (ordinal regression) head types.
 """
 import argparse
+from datetime import datetime
 import json
 import logging
 import os
+import platform
+import subprocess
 import sys
 
 import numpy as np
 import pandas as pd
 import torch
-import wandb
 import torch.nn as nn
-from sklearn.metrics import f1_score, precision_score, recall_score, roc_auc_score
+import torch.nn.functional as F
+from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from constants import DEFAULT_ENCODER, DEFAULT_MAX_LENGTH, T_NUM_LABELS, N_NUM_LABELS, M_NUM_LABELS
-from dataset import TNMDataset
-from model import TNMClassifier
-from tnm_regex import encode_hints
+from constants import (
+    DEFAULT_ENCODER, DEFAULT_MAX_LENGTH,
+    T_NUM_LABELS, N_NUM_LABELS, M_NUM_LABELS,
+    DEFAULT_LORA_R, DEFAULT_LORA_ALPHA, DEFAULT_LORA_DROPOUT,
+)
+from data.dataset import TNMDataset
+from models.classifier import TNMClassifier
 
 logger = logging.getLogger(__name__)
+
+
+def is_output_dir_explicit(argv):
+    """Return True if user explicitly passed --output-dir."""
+    return any(arg == "--output-dir" or arg.startswith("--output-dir=") for arg in argv)
+
+
+def get_git_commit_hash():
+    """Best-effort git commit hash for reproducibility metadata."""
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return None
 
 
 def set_seed(seed: int):
@@ -32,15 +53,56 @@ def set_seed(seed: int):
         torch.cuda.manual_seed_all(seed)
 
 
-def masked_loss(criterion, logits, labels, mask):
-    """Compute loss only on samples where the label is valid (mask=True).
+# ---------------------------------------------------------------------------
+# Loss helpers
+# ---------------------------------------------------------------------------
 
-    Returns 0.0 if no valid samples in the batch.
-    """
+def masked_ce_loss(criterion, logits, labels, mask):
+    """CE loss only on valid samples."""
     if mask.any():
         return criterion(logits[mask], labels[mask])
     return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
+
+def coral_loss(logits, labels, mask):
+    """CORAL ordinal loss: sum of K-1 binary cross-entropies."""
+    if not mask.any():
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+    logits = logits[mask]
+    labels = labels[mask]
+    num_thresholds = logits.shape[1]
+    levels = torch.arange(num_thresholds, device=logits.device).float()
+    targets = (labels.unsqueeze(1).float() > levels).float()
+    return F.binary_cross_entropy_with_logits(logits, targets)
+
+
+def binary_loss(logits, labels, mask):
+    """BCE for binary M head (CORAL mode)."""
+    if not mask.any():
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+    logits = logits[mask].squeeze(-1)
+    labels = labels[mask].float()
+    return F.binary_cross_entropy_with_logits(logits, labels)
+
+
+# ---------------------------------------------------------------------------
+# Prediction helpers
+# ---------------------------------------------------------------------------
+
+def coral_predict(logits):
+    """Predict class from CORAL logits: count thresholds exceeded."""
+    probs = torch.sigmoid(logits)
+    return (probs > 0.5).sum(dim=1).long()
+
+
+def binary_predict(logits):
+    """Predict class from binary logit."""
+    return (torch.sigmoid(logits.squeeze(-1)) > 0.5).long()
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 
 def compute_metrics(pred_t, pred_n, pred_m, true_t, true_n, true_m,
                     mask_t=None, mask_n=None, mask_m=None):
@@ -72,26 +134,17 @@ def compute_metrics(pred_t, pred_n, pred_m, true_t, true_n, true_m,
     f1_n = _f1(tn, pn, "macro") if mask_n.any() else 0.0
     f1_m = _f1(tm, pm, "macro") if mask_m.any() else 0.0
 
-    # Per-head micro metrics
-    mi_f1_t  = _f1(tt, pt, "micro")   if mask_t.any() else 0.0
-    mi_pr_t  = _prec(tt, pt, "micro") if mask_t.any() else 0.0
-    mi_re_t  = _rec(tt, pt, "micro")  if mask_t.any() else 0.0
-    mi_f1_n  = _f1(tn, pn, "micro")   if mask_n.any() else 0.0
-    mi_pr_n  = _prec(tn, pn, "micro") if mask_n.any() else 0.0
-    mi_re_n  = _rec(tn, pn, "micro")  if mask_n.any() else 0.0
-    mi_f1_m  = _f1(tm, pm, "micro")   if mask_m.any() else 0.0
-    mi_pr_m  = _prec(tm, pm, "micro") if mask_m.any() else 0.0
-    mi_re_m  = _rec(tm, pm, "micro")  if mask_m.any() else 0.0
+    mi_f1_t = _f1(tt, pt, "micro") if mask_t.any() else 0.0
+    mi_f1_n = _f1(tn, pn, "micro") if mask_n.any() else 0.0
+    mi_f1_m = _f1(tm, pm, "micro") if mask_m.any() else 0.0
 
-    # Per-head macro precision/recall
-    ma_pr_t  = _prec(tt, pt, "macro") if mask_t.any() else 0.0
-    ma_re_t  = _rec(tt, pt, "macro")  if mask_t.any() else 0.0
-    ma_pr_n  = _prec(tn, pn, "macro") if mask_n.any() else 0.0
-    ma_re_n  = _rec(tn, pn, "macro")  if mask_n.any() else 0.0
-    ma_pr_m  = _prec(tm, pm, "macro") if mask_m.any() else 0.0
-    ma_re_m  = _rec(tm, pm, "macro")  if mask_m.any() else 0.0
+    ma_pr_t = _prec(tt, pt, "macro") if mask_t.any() else 0.0
+    ma_re_t = _rec(tt, pt, "macro") if mask_t.any() else 0.0
+    ma_pr_n = _prec(tn, pn, "macro") if mask_n.any() else 0.0
+    ma_re_n = _rec(tn, pn, "macro") if mask_n.any() else 0.0
+    ma_pr_m = _prec(tm, pm, "macro") if mask_m.any() else 0.0
+    ma_re_m = _rec(tm, pm, "macro") if mask_m.any() else 0.0
 
-    # Exact match only on samples with ALL labels valid
     all_valid = mask_t & mask_n & mask_m
     if all_valid.any():
         exact = float(np.mean(
@@ -103,36 +156,118 @@ def compute_metrics(pred_t, pred_n, pred_m, true_t, true_n, true_m,
         exact = 0.0
 
     return {
-        "f1_t": float(f1_t),
-        "f1_n": float(f1_n),
-        "f1_m": float(f1_m),
-        "f1_macro_avg": float((f1_t + f1_n + f1_m) / 3),
-        "exact_match": float(exact),
-        # Micro-averaged (mean across heads)
-        "micro_f1":        (mi_f1_t + mi_f1_n + mi_f1_m) / 3,
-        "micro_precision": (mi_pr_t + mi_pr_n + mi_pr_m) / 3,
-        "micro_recall":    (mi_re_t + mi_re_n + mi_re_m) / 3,
-        # Macro-averaged precision/recall (mean across heads)
+        "f1_t": f1_t, "f1_n": f1_n, "f1_m": f1_m,
+        "f1_macro_avg": (f1_t + f1_n + f1_m) / 3,
+        "exact_match": exact,
+        "micro_f1": (mi_f1_t + mi_f1_n + mi_f1_m) / 3,
         "macro_precision": (ma_pr_t + ma_pr_n + ma_pr_m) / 3,
-        "macro_recall":    (ma_re_t + ma_re_n + ma_re_m) / 3,
+        "macro_recall": (ma_re_t + ma_re_n + ma_re_m) / 3,
         "n_valid_t": int(mask_t.sum()),
         "n_valid_n": int(mask_n.sum()),
         "n_valid_m": int(mask_m.sum()),
     }
 
 
-def train_epoch(model, loader, optimizer, device, criterion_t, criterion_n, criterion_m,
-                active_heads=("t", "n", "m")):
-    """Train one epoch with masked loss per head.
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
-    Args:
-        active_heads: Which heads to train. Use ("t", "n") for phase-1 of
-                      two-phase training (freeze M head).
+def load_data(data_dir, val_size, seed):
+    """Load train/val data.
+
+    Handles the competition format: columns = patient_filename, text, t, n, m
+    where t is 1-indexed (1-4), n is 0-indexed (0-3), m is 0-indexed (0-1),
+    and NaN means missing label.
+
+    If ``val.csv`` exists in ``data_dir`` and has TNM labels, it is used directly.
+    Otherwise, ``train.csv`` is split by ``val_size``.
     """
+    train_path = os.path.join(data_dir, "train.csv")
+    val_path = os.path.join(data_dir, "val.csv")
+
+    def _normalize(df: pd.DataFrame) -> pd.DataFrame:
+        required_cols = ["patient_filename", "text", "t", "n", "m"]
+        missing_cols = [c for c in required_cols if c not in df.columns]
+
+        # Ensure expected columns exist so downstream code can always access them.
+        # Missing labels are represented by sentinel -1.
+        if "patient_filename" not in df.columns:
+            df["patient_filename"] = ""
+        if "text" not in df.columns:
+            raise ValueError("Input CSV must contain a 'text' column.")
+        for col in ("t", "n", "m"):
+            if col not in df.columns:
+                df[col] = -1
+
+        # Normalize t to 0-indexed (T1->0, T2->1, T3->2, T4->3)
+        df = df.copy()
+        df["t"] = pd.to_numeric(df["t"], errors="coerce") - 1
+
+        # Fill missing with sentinel -1
+        for col in ("t", "n", "m"):
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(-1).astype(int)
+
+        if missing_cols:
+            logger.warning("CSV missing columns %s; filled with defaults where possible.", missing_cols)
+        return df
+
+    def _has_labeled_targets(df: pd.DataFrame) -> bool:
+        if not all(col in df.columns for col in ("t", "n", "m")):
+            return False
+        # Need at least one valid label in each head for meaningful validation.
+        return all(pd.to_numeric(df[col], errors="coerce").notna().any() for col in ("t", "n", "m"))
+
+    train_df = _normalize(pd.read_csv(train_path))
+    if os.path.exists(val_path):
+        raw_val_df = pd.read_csv(val_path)
+        if _has_labeled_targets(raw_val_df):
+            val_df = _normalize(raw_val_df)
+            logger.info("Using provided validation split: %s", val_path)
+        else:
+            logger.warning(
+                "Found %s but it has no TNM labels (t/n/m). Falling back to train split (val_size=%.2f).",
+                val_path,
+                val_size,
+            )
+            valid_t = train_df["t"].clip(lower=0)
+            try:
+                train_df, val_df = train_test_split(
+                    train_df, test_size=val_size, stratify=valid_t, random_state=seed,
+                )
+            except ValueError:
+                logger.warning("Stratified split failed, falling back to random.")
+                train_df, val_df = train_test_split(train_df, test_size=val_size, random_state=seed)
+    else:
+        # Stratified split on t (most samples have t labels)
+        valid_t = train_df["t"].clip(lower=0)
+        try:
+            train_df, val_df = train_test_split(
+                train_df, test_size=val_size, stratify=valid_t, random_state=seed,
+            )
+        except ValueError:
+            logger.warning("Stratified split failed, falling back to random.")
+            train_df, val_df = train_test_split(train_df, test_size=val_size, random_state=seed)
+
+    logger.info("Train: %d samples, Val: %d samples", len(train_df), len(val_df))
+    for name, part in [("train", train_df), ("val", val_df)]:
+        for col in ("t", "n", "m"):
+            valid = (part[col] >= 0).sum()
+            logger.info("  %s %s: %d valid / %d total", name, col, valid, len(part))
+    return train_df, val_df
+
+
+# ---------------------------------------------------------------------------
+# Training / evaluation loops
+# ---------------------------------------------------------------------------
+
+def train_epoch(model, loader, optimizer, scheduler, device, grad_accum_steps,
+                head_type, criterion_t=None, criterion_n=None, criterion_m=None,
+                train_pbar=None):
     model.train()
     total_loss = 0.0
-    for batch in tqdm(loader, desc="Train", leave=False):
-        optimizer.zero_grad()
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(loader):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels_t = batch["labels_t"].to(device)
@@ -146,90 +281,81 @@ def train_epoch(model, loader, optimizer, device, criterion_t, criterion_n, crit
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(device)
 
-        hint_t = batch["hint_t"].to(device) if "hint_t" in batch else None
-        hint_n = batch["hint_n"].to(device) if "hint_n" in batch else None
-        hint_m = batch["hint_m"].to(device) if "hint_m" in batch else None
-
         logits_t, logits_n, logits_m = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            hint_t=hint_t,
-            hint_n=hint_n,
-            hint_m=hint_m,
+            input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
         )
 
-        loss = torch.tensor(0.0, device=device, requires_grad=True)
-        if "t" in active_heads:
-            loss = loss + masked_loss(criterion_t, logits_t, labels_t, mask_t)
-        if "n" in active_heads:
-            loss = loss + masked_loss(criterion_n, logits_n, labels_n, mask_n)
-        if "m" in active_heads:
-            loss = loss + masked_loss(criterion_m, logits_m, labels_m, mask_m)
+        if head_type == "coral":
+            loss = (coral_loss(logits_t, labels_t, mask_t)
+                    + coral_loss(logits_n, labels_n, mask_n)
+                    + binary_loss(logits_m, labels_m, mask_m))
+        else:
+            loss = (masked_ce_loss(criterion_t, logits_t, labels_t, mask_t)
+                    + masked_ce_loss(criterion_n, logits_n, labels_n, mask_n)
+                    + masked_ce_loss(criterion_m, logits_m, labels_m, mask_m))
 
+        loss = loss / grad_accum_steps
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        total_loss += loss.item()
+
+        if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(loader):
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
+            if train_pbar is not None:
+                train_pbar.update(1)
+
+        total_loss += loss.item() * grad_accum_steps
     return total_loss / len(loader)
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, head_type):
     model.eval()
     preds_t, preds_n, preds_m = [], [], []
     trues_t, trues_n, trues_m = [], [], []
     masks_t, masks_n, masks_m = [], [], []
-    probs_m = []
+
     for batch in tqdm(loader, desc="Eval", leave=False):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         token_type_ids = batch.get("token_type_ids")
         if token_type_ids is not None:
             token_type_ids = token_type_ids.to(device)
-        hint_t = batch["hint_t"].to(device) if "hint_t" in batch else None
-        hint_n = batch["hint_n"].to(device) if "hint_n" in batch else None
-        hint_m = batch["hint_m"].to(device) if "hint_m" in batch else None
+
         logits_t, logits_n, logits_m = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            hint_t=hint_t,
-            hint_n=hint_n,
-            hint_m=hint_m,
+            input_ids=input_ids, attention_mask=attention_mask, token_type_ids=token_type_ids,
         )
-        preds_t.append(logits_t.argmax(1).cpu().numpy())
-        preds_n.append(logits_n.argmax(1).cpu().numpy())
-        preds_m.append(logits_m.argmax(1).cpu().numpy())
-        probs_m.append(torch.softmax(logits_m, 1).cpu().numpy())
+
+        if head_type == "coral":
+            preds_t.append(coral_predict(logits_t).cpu().numpy())
+            preds_n.append(coral_predict(logits_n).cpu().numpy())
+            preds_m.append(binary_predict(logits_m).cpu().numpy())
+        else:
+            preds_t.append(logits_t.argmax(1).cpu().numpy())
+            preds_n.append(logits_n.argmax(1).cpu().numpy())
+            preds_m.append(logits_m.argmax(1).cpu().numpy())
+
         trues_t.append(batch["labels_t"].numpy())
         trues_n.append(batch["labels_n"].numpy())
         trues_m.append(batch["labels_m"].numpy())
         masks_t.append(batch["mask_t"].numpy())
         masks_n.append(batch["mask_n"].numpy())
         masks_m.append(batch["mask_m"].numpy())
-    preds_t = np.concatenate(preds_t)
-    preds_n = np.concatenate(preds_n)
-    preds_m = np.concatenate(preds_m)
-    trues_t = np.concatenate(trues_t)
-    trues_n = np.concatenate(trues_n)
-    trues_m = np.concatenate(trues_m)
-    masks_t = np.concatenate(masks_t).astype(bool)
-    masks_n = np.concatenate(masks_n).astype(bool)
-    masks_m = np.concatenate(masks_m).astype(bool)
-    probs_m = np.concatenate(probs_m)
 
-    metrics = compute_metrics(preds_t, preds_n, preds_m, trues_t, trues_n, trues_m,
-                              masks_t, masks_n, masks_m)
-    try:
-        if masks_m.any():
-            metrics["auroc_m"] = float(roc_auc_score(trues_m[masks_m], probs_m[masks_m, 1]))
-        else:
-            metrics["auroc_m"] = 0.0
-    except ValueError:
-        metrics["auroc_m"] = 0.0
-    return metrics
+    return compute_metrics(
+        np.concatenate(preds_t), np.concatenate(preds_n), np.concatenate(preds_m),
+        np.concatenate(trues_t), np.concatenate(trues_n), np.concatenate(trues_m),
+        np.concatenate(masks_t).astype(bool),
+        np.concatenate(masks_n).astype(bool),
+        np.concatenate(masks_m).astype(bool),
+    )
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
@@ -239,190 +365,239 @@ def main():
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--eval-batch-size", type=int, default=32)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--head-lr", type=float, default=None,
+                        help="Separate LR for classification heads (default: same as --lr)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-ratio", type=float, default=0.1)
+    parser.add_argument("--val-size", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--no-class-weights-m", action="store_true",
-                        help="Disable class weighting for M stage")
-    parser.add_argument("--two-phase", type=int, default=0, metavar="N",
-                        help="Two-phase training: train T+N heads for N epochs first, "
-                             "then all heads for remaining epochs. 0 = disabled (default).")
-    parser.add_argument("--resume", default=None, metavar="CHECKPOINT",
-                        help="Path to a checkpoint (.pt) to resume training from.")
-    parser.add_argument("--wandb", action="store_true",
-                        help="Enable Weights & Biases logging.")
-    parser.add_argument("--wandb-project", default="tnm-staging",
-                        help="W&B project name (default: tnm-staging).")
-    parser.add_argument("--wandb-run-name", default=None,
-                        help="W&B run name (optional).")
-    parser.add_argument("--regex-hints", action="store_true",
-                        help="Augment the model with regex-extracted TNM hint embeddings.")
+    # Head type
+    parser.add_argument("--head-type", choices=["ce", "coral"], default="ce",
+                        help="Classification head type: ce (cross-entropy) or coral (ordinal)")
+    parser.add_argument("--no-class-weights-m", action="store_true")
+    # LoRA args (set --lora-r 0 to disable)
+    parser.add_argument("--lora-r", type=int, default=0)
+    parser.add_argument("--lora-alpha", type=int, default=DEFAULT_LORA_ALPHA)
+    parser.add_argument("--lora-dropout", type=float, default=DEFAULT_LORA_DROPOUT)
+    parser.add_argument("--lora-targets", nargs="+", default=None)
+    # W&B
+    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-project", default="tnm-staging")
+    parser.add_argument("--wandb-run-name", default=None)
+    # Resume
+    parser.add_argument("--resume", default=None, metavar="CHECKPOINT")
+    cli_args = sys.argv[1:]
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    use_class_weights_m = not args.no_class_weights_m
-
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    start_time = datetime.now()
+    start_time_str = start_time.strftime("%Y%m%d_%H%M")
+    if not is_output_dir_explicit(cli_args):
+        args.output_dir = os.path.join(args.output_dir, start_time_str)
+
     logger.info("Using device: %s", device)
+    logger.info("Output directory: %s", args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
     wandb_run = None
     if args.wandb:
+        import wandb
         wandb_run = wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
+            project=args.wandb_project, name=args.wandb_run_name, config=vars(args),
         )
         logger.info("W&B run: %s", wandb_run.url)
 
-    # Data
-    train_df = pd.read_csv(os.path.join(args.data_dir, "train.csv"))
-    val_df = pd.read_csv(os.path.join(args.data_dir, "val.csv"))
-    texts_train = train_df["text"].astype(str).tolist()
-    texts_val = val_df["text"].astype(str).tolist()
-    t_train = train_df["T"].values
-    n_train = train_df["N"].values
-    m_train = train_df["M"].values
-    t_val = val_df["T"].values
-    n_val = val_df["N"].values
-    m_val = val_df["M"].values
+    # ---- Data ----
+    train_df, val_df = load_data(args.data_dir, args.val_size, args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.encoder)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     enc_train = tokenizer(
-        texts_train,
-        padding=True,
-        truncation=True,
-        max_length=args.max_length,
-        return_tensors="np",
+        train_df["text"].astype(str).tolist(), padding=True, truncation=True,
+        max_length=args.max_length, return_tensors="np",
     )
     enc_val = tokenizer(
-        texts_val,
-        padding=True,
-        truncation=True,
-        max_length=args.max_length,
-        return_tensors="np",
+        val_df["text"].astype(str).tolist(), padding=True, truncation=True,
+        max_length=args.max_length, return_tensors="np",
     )
 
-    if args.regex_hints:
-        logger.info("Extracting regex hints for train set...")
-        ht_train, hn_train, hm_train = encode_hints(texts_train)
-        logger.info("Extracting regex hints for val set...")
-        ht_val, hn_val, hm_val = encode_hints(texts_val)
-    else:
-        ht_train = hn_train = hm_train = None
-        ht_val = hn_val = hm_val = None
+    train_ds = TNMDataset(enc_train, train_df["t"].values, train_df["n"].values, train_df["m"].values)
+    val_ds = TNMDataset(enc_val, val_df["t"].values, val_df["n"].values, val_df["m"].values)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
+    val_loader = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=0)
 
-    train_ds = TNMDataset(enc_train, t_train, n_train, m_train,
-                          hint_t=ht_train, hint_n=hn_train, hint_m=hm_train)
-    val_ds = TNMDataset(enc_val, t_val, n_val, m_val,
-                        hint_t=ht_val, hint_n=hn_val, hint_m=hm_val)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=False,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.eval_batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
+    # ---- Loss (CE mode only — CORAL computes loss inline) ----
+    criterion_t, criterion_n, criterion_m = None, None, None
+    if args.head_type == "ce":
+        valid_m = train_df["m"].values
+        valid_m = valid_m[valid_m >= 0]
+        if not args.no_class_weights_m and len(valid_m) > 0:
+            m_counts = np.bincount(valid_m, minlength=M_NUM_LABELS)
+            m_weights = 1.0 / (m_counts + 1e-6)
+            m_weights = m_weights / m_weights.sum() * M_NUM_LABELS
+            weight_m = torch.tensor(m_weights, dtype=torch.float32).to(device)
+        else:
+            weight_m = None
+        criterion_t = nn.CrossEntropyLoss()
+        criterion_n = nn.CrossEntropyLoss()
+        criterion_m = nn.CrossEntropyLoss(weight=weight_m)
 
-    # Class weights for M (only computed from valid M labels)
-    valid_m_train = m_train[m_train >= 0]
-    if use_class_weights_m and len(valid_m_train) > 0:
-        m_counts = np.bincount(valid_m_train, minlength=M_NUM_LABELS)
-        m_weights = 1.0 / (m_counts + 1e-6)
-        m_weights = m_weights / m_weights.sum() * M_NUM_LABELS
-        weight_m = torch.tensor(m_weights, dtype=torch.float32).to(device)
-    else:
-        weight_m = None
-    criterion_t = nn.CrossEntropyLoss()
-    criterion_n = nn.CrossEntropyLoss()
-    criterion_m = nn.CrossEntropyLoss(weight=weight_m)
-
+    # ---- Model ----
+    torch_dtype = torch.bfloat16 if args.lora_r > 0 else torch.float32
     model = TNMClassifier(
         encoder_name=args.encoder,
         t_num_labels=T_NUM_LABELS,
         n_num_labels=N_NUM_LABELS,
         m_num_labels=M_NUM_LABELS,
-        use_regex_hints=args.regex_hints,
+        dropout=0.1,
+        head_type=args.head_type,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
+        lora_targets=args.lora_targets,
+        torch_dtype=torch_dtype,
     ).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+
+    # Optimizer
+    head_lr = args.head_lr or args.lr
+    if args.lora_r > 0 and args.head_lr:
+        backbone_params = [p for n, p in model.named_parameters()
+                           if p.requires_grad and "head" not in n]
+        head_params = [p for n, p in model.named_parameters()
+                       if p.requires_grad and "head" in n]
+        optimizer = torch.optim.AdamW([
+            {"params": backbone_params, "lr": args.lr, "weight_decay": args.weight_decay},
+            {"params": head_params, "lr": head_lr, "weight_decay": 0.0},
+        ])
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    # Scheduler: linear warmup + cosine decay
+    updates_per_epoch = max(1, (len(train_loader) + args.grad_accum_steps - 1) // args.grad_accum_steps)
+    total_steps = updates_per_epoch * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     start_epoch = 0
-    best_exact = 0.0
+    best_f1 = 0.0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
         start_epoch = ckpt.get("epoch", 0) + 1
-        best_exact = ckpt.get("metrics", {}).get("exact_match", 0.0)
-        logger.info("Resumed from %s (epoch %d, best_exact=%.4f)", args.resume, start_epoch, best_exact)
+        best_f1 = ckpt.get("metrics", {}).get("f1_macro_avg", 0.0)
+        logger.info("Resumed from %s (epoch %d, best_f1=%.4f)", args.resume, start_epoch, best_f1)
 
-    phase1_epochs = args.two_phase
+    # ---- Training loop ----
+    train_history = []
+    best_metrics = None
+    initial_step = start_epoch * updates_per_epoch
+    train_pbar = tqdm(total=total_steps, initial=initial_step, desc="Train", leave=True)
     for epoch in range(start_epoch, args.epochs):
-        # Two-phase: first N epochs train only T+N, remaining train all
-        if phase1_epochs > 0 and epoch < phase1_epochs:
-            active_heads = ("t", "n")
-            phase_label = "phase1(T+N)"
-        else:
-            active_heads = ("t", "n", "m")
-            phase_label = "phase2(all)" if phase1_epochs > 0 else "all"
-
         loss_avg = train_epoch(
-            model, train_loader, optimizer, device,
+            model, train_loader, optimizer, scheduler, device,
+            args.grad_accum_steps, args.head_type,
             criterion_t, criterion_n, criterion_m,
-            active_heads=active_heads,
+            train_pbar,
         )
-        metrics = evaluate(model, val_loader, device)
+        metrics = evaluate(model, val_loader, device, args.head_type)
         logger.info(
-            "Epoch %d [%s] loss=%.4f F1_T=%.4f F1_N=%.4f F1_M=%.4f exact_match=%.4f",
-            epoch + 1, phase_label, loss_avg,
+            "Epoch %d  loss=%.4f  F1_T=%.4f  F1_N=%.4f  F1_M=%.4f  F1_avg=%.4f  exact=%.4f",
+            epoch + 1, loss_avg,
             metrics["f1_t"], metrics["f1_n"], metrics["f1_m"],
-            metrics["exact_match"],
+            metrics["f1_macro_avg"], metrics["exact_match"],
         )
         if wandb_run is not None:
             wandb_run.log({
                 "epoch": epoch + 1,
                 "train/loss": loss_avg,
-                "val/f1_t": metrics["f1_t"],
-                "val/f1_n": metrics["f1_n"],
-                "val/f1_m": metrics["f1_m"],
-                "val/f1_macro_avg": metrics["f1_macro_avg"],
-                "val/exact_match": metrics["exact_match"],
-                "val/auroc_m": metrics.get("auroc_m", 0.0),
-                "val/micro_f1": metrics["micro_f1"],
-                "val/micro_precision": metrics["micro_precision"],
-                "val/micro_recall": metrics["micro_recall"],
-                "val/macro_f1": metrics["f1_macro_avg"],
-                "val/macro_precision": metrics["macro_precision"],
-                "val/macro_recall": metrics["macro_recall"],
+                **{f"val/{k}": v for k, v in metrics.items()},
             })
-        if metrics["exact_match"] > best_exact:
-            best_exact = metrics["exact_match"]
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "epoch": epoch,
-                    "metrics": metrics,
+
+        train_history.append({
+            "epoch": epoch + 1,
+            "train_loss": float(loss_avg),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            **{k: float(v) if isinstance(v, (int, float, np.floating)) else v for k, v in metrics.items()},
+        })
+
+        if metrics["f1_macro_avg"] > best_f1:
+            best_f1 = metrics["f1_macro_avg"]
+            best_metrics = metrics
+            save_dict = {"epoch": epoch, "metrics": metrics}
+            if model.use_lora:
+                save_dict["model_state_dict"] = model.get_trainable_state_dict()
+            else:
+                save_dict["model_state_dict"] = model.state_dict()
+            torch.save(save_dict, os.path.join(args.output_dir, "best.pt"))
+    train_pbar.close()
+
+    if train_history:
+        pd.DataFrame(train_history).to_csv(os.path.join(args.output_dir, "train_metrics.csv"), index=False)
+
+    run_metadata = {
+        "start_time": start_time.isoformat(),
+        "end_time": datetime.now().isoformat(),
+        "timestamp_dir": start_time_str,
+        "command": " ".join([sys.executable] + sys.argv),
+        "python_version": platform.python_version(),
+        "platform": platform.platform(),
+        "pytorch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "transformers_version": __import__("transformers").__version__,
+        "device": str(device),
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "git_commit": get_git_commit_hash(),
+    }
+
+    reproducibility = {
+        "args": vars(args),
+        "data": {
+            "train_samples": len(train_df),
+            "val_samples": len(val_df),
+            "valid_labels": {
+                "train": {
+                    "t": int((train_df["t"] >= 0).sum()),
+                    "n": int((train_df["n"] >= 0).sum()),
+                    "m": int((train_df["m"] >= 0).sum()),
                 },
-                os.path.join(args.output_dir, "best.pt"),
-            )
-    # Save config for predict
+                "val": {
+                    "t": int((val_df["t"] >= 0).sum()),
+                    "n": int((val_df["n"] >= 0).sum()),
+                    "m": int((val_df["m"] >= 0).sum()),
+                },
+            },
+        },
+        "training": {
+            "updates_per_epoch": updates_per_epoch,
+            "total_steps": total_steps,
+            "warmup_steps": warmup_steps,
+            "effective_batch_size": args.batch_size * args.grad_accum_steps,
+            "best_f1_macro_avg": float(best_f1),
+            "best_metrics": best_metrics,
+        },
+        "run_metadata": run_metadata,
+    }
+
     with open(os.path.join(args.output_dir, "train_config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
-    logger.info("Best exact_match=%.4f saved to %s/best.pt", best_exact, args.output_dir)
+    with open(os.path.join(args.output_dir, "reproducibility.json"), "w") as f:
+        json.dump(reproducibility, f, indent=2)
+    logger.info("Best f1_macro_avg=%.4f saved to %s/best.pt", best_f1, args.output_dir)
     if wandb_run is not None:
         wandb_run.finish()
     return 0
