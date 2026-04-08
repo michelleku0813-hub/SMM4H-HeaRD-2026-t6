@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, precision_score, recall_score
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -172,15 +171,14 @@ def compute_metrics(pred_t, pred_n, pred_m, true_t, true_n, true_m,
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_data(data_dir, val_size, seed):
+def load_data(data_dir, meta_dir="TCGA_Metadata"):
     """Load train/val data.
 
     Handles the competition format: columns = patient_filename, text, t, n, m
     where t is 1-indexed (1-4), n is 0-indexed (0-3), m is 0-indexed (0-1),
     and NaN means missing label.
 
-    If ``val.csv`` exists in ``data_dir`` and has TNM labels, it is used directly.
-    Otherwise, ``train.csv`` is split by ``val_size``.
+    If ``val.csv`` has no TNM labels, attempts to enrich from TCGA_Metadata.
     """
     train_path = os.path.join(data_dir, "train.csv")
     val_path = os.path.join(data_dir, "val.csv")
@@ -217,36 +215,66 @@ def load_data(data_dir, val_size, seed):
         # Need at least one valid label in each head for meaningful validation.
         return all(pd.to_numeric(df[col], errors="coerce").notna().any() for col in ("t", "n", "m"))
 
+    def _enrich_with_metadata(df: pd.DataFrame, meta_dir: str) -> pd.DataFrame:
+        """Join TCGA_Metadata labels into an unlabeled DataFrame."""
+        from data.data_prep import map_t_to_t14, map_n_to_n03, map_m_to_m01
+
+        t_path = os.path.join(meta_dir, "TCGA_T14_patients.csv")
+        n_path = os.path.join(meta_dir, "TCGA_N03_patients.csv")
+        m_path = os.path.join(meta_dir, "TCGA_M01_patients.csv")
+        if not all(os.path.exists(p) for p in (t_path, n_path, m_path)):
+            return None
+
+        df = df.copy()
+        df["case_submitter_id"] = df["patient_filename"].str.split(".").str[0]
+
+        t_df = pd.read_csv(t_path)
+        t_df["t"] = t_df["ajcc_pathologic_t"].apply(map_t_to_t14)
+        t_df = t_df.dropna(subset=["t"]).astype({"t": int})
+        t_df = t_df[["case_submitter_id", "t"]].drop_duplicates(subset=["case_submitter_id"], keep="first")
+
+        n_df = pd.read_csv(n_path)
+        n_df["n"] = n_df["ajcc_pathologic_n"].apply(map_n_to_n03)
+        n_df = n_df.dropna(subset=["n"]).astype({"n": int})
+        n_df = n_df[["case_submitter_id", "n"]].drop_duplicates(subset=["case_submitter_id"], keep="first")
+
+        m_df = pd.read_csv(m_path)
+        m_df["m"] = m_df["ajcc_pathologic_m"].apply(map_m_to_m01)
+        m_df = m_df.dropna(subset=["m"]).astype({"m": int})
+        m_df = m_df[["case_submitter_id", "m"]].drop_duplicates(subset=["case_submitter_id"], keep="first")
+
+        df = df.merge(t_df, on="case_submitter_id", how="left")
+        df = df.merge(n_df, on="case_submitter_id", how="left")
+        df = df.merge(m_df, on="case_submitter_id", how="left")
+        df.drop(columns=["case_submitter_id"], inplace=True)
+
+        # t from metadata is already 0-indexed, just fill missing with -1
+        for col in ("t", "n", "m"):
+            df[col] = df[col].fillna(-1).astype(int)
+
+        logger.info(
+            "Enriched val from metadata: T=%d, N=%d, M=%d valid out of %d",
+            (df["t"] >= 0).sum(), (df["n"] >= 0).sum(), (df["m"] >= 0).sum(), len(df),
+        )
+        return df
+
     train_df = _normalize(pd.read_csv(train_path))
-    if os.path.exists(val_path):
-        raw_val_df = pd.read_csv(val_path)
-        if _has_labeled_targets(raw_val_df):
-            val_df = _normalize(raw_val_df)
-            logger.info("Using provided validation split: %s", val_path)
-        else:
-            logger.warning(
-                "Found %s but it has no TNM labels (t/n/m). Falling back to train split (val_size=%.2f).",
-                val_path,
-                val_size,
-            )
-            valid_t = train_df["t"].clip(lower=0)
-            try:
-                train_df, val_df = train_test_split(
-                    train_df, test_size=val_size, stratify=valid_t, random_state=seed,
-                )
-            except ValueError:
-                logger.warning("Stratified split failed, falling back to random.")
-                train_df, val_df = train_test_split(train_df, test_size=val_size, random_state=seed)
+
+    if not os.path.exists(val_path):
+        raise FileNotFoundError(f"Validation file not found: {val_path}")
+
+    raw_val_df = pd.read_csv(val_path)
+    if _has_labeled_targets(raw_val_df):
+        val_df = _normalize(raw_val_df)
+        logger.info("Using provided validation split: %s", val_path)
     else:
-        # Stratified split on t (most samples have t labels)
-        valid_t = train_df["t"].clip(lower=0)
-        try:
-            train_df, val_df = train_test_split(
-                train_df, test_size=val_size, stratify=valid_t, random_state=seed,
+        logger.info("val.csv has no labels, enriching from %s ...", meta_dir)
+        val_df = _enrich_with_metadata(raw_val_df, meta_dir)
+        if val_df is None:
+            raise FileNotFoundError(
+                f"val.csv has no labels and metadata not found at {meta_dir}. "
+                "Run data_prep.py --enrich-val first."
             )
-        except ValueError:
-            logger.warning("Stratified split failed, falling back to random.")
-            train_df, val_df = train_test_split(train_df, test_size=val_size, random_state=seed)
 
     logger.info("Train: %d samples, Val: %d samples", len(train_df), len(val_df))
     for name, part in [("train", train_df), ("val", val_df)]:
@@ -372,7 +400,8 @@ def main():
                         help="Separate LR for classification heads (default: same as --lr)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--warmup-ratio", type=float, default=0.1)
-    parser.add_argument("--val-size", type=float, default=0.15)
+    parser.add_argument("--meta-dir", default="TCGA_Metadata",
+                        help="Directory with TCGA metadata CSVs for val label enrichment")
     parser.add_argument("--seed", type=int, default=0)
     # Head type
     parser.add_argument("--head-type", choices=["ce", "coral"], default="ce",
@@ -414,7 +443,7 @@ def main():
         logger.info("W&B run: %s", wandb_run.url)
 
     # ---- Data ----
-    train_df, val_df = load_data(args.data_dir, args.val_size, args.seed)
+    train_df, val_df = load_data(args.data_dir, args.meta_dir)
 
     tokenizer = AutoTokenizer.from_pretrained(args.encoder)
     if tokenizer.pad_token is None:
