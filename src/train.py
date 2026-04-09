@@ -436,6 +436,10 @@ def main():
     logger.info("Output directory: %s", args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Save train config early so it's available even if training is interrupted
+    with open(os.path.join(args.output_dir, "train_config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
     wandb_run = None
     if args.wandb:
         import wandb
