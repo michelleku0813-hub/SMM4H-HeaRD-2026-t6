@@ -26,13 +26,14 @@ Output: `data/train.csv`, `data/val.csv`, `data/test.csv` with columns: `patient
 
 ## 2. Training
 
-Train a single encoder (Bio_ClinicalBERT) with three heads for T, N, and M:
+Train BioClinical-ModernBERT-large with three heads for T, N, and M:
 
 ```bash
-uv run python src/train.py --data-dir data --output-dir outputs --epochs 5 --batch-size 16
+uv run python src/train.py --data-dir data --output-dir outputs_large \
+  --batch-size 4 --grad-accum-steps 2 --epochs 8 --lr 2e-5
 ```
 
-Options: `--encoder`, `--max-length`, `--lr`, `--weight-decay`, `--seed`, `--no-class-weights-m`. Best checkpoint (by validation exact-match) is saved to `outputs/best.pt` and config to `outputs/train_config.json`. Class weights for M are enabled by default.
+Options: `--encoder`, `--max-length`, `--lr`, `--weight-decay`, `--seed`, `--focal-loss`, `--focal-gamma`, `--label-smoothing`, `--no-class-weights`. Best checkpoint (by validation F1 macro avg) is saved to `outputs/best.pt` and config to `outputs/train_config.json`. Inverse-frequency class weights for T, N, M are enabled by default.
 
 ## 3. Prediction and submission
 
