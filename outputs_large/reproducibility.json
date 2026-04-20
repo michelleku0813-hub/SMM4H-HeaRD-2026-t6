@@ -1,0 +1,81 @@
+{
+  "args": {
+    "data_dir": "data",
+    "output_dir": "outputs_large",
+    "encoder": "thomas-sounack/BioClinical-ModernBERT-large",
+    "max_length": 4096,
+    "batch_size": 4,
+    "eval_batch_size": 16,
+    "grad_accum_steps": 2,
+    "epochs": 8,
+    "lr": 2e-05,
+    "head_lr": null,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "meta_dir": "TCGA_Metadata",
+    "seed": 0,
+    "head_type": "ce",
+    "focal_loss": false,
+    "focal_gamma": 2.0,
+    "label_smoothing": 0.0,
+    "no_class_weights": false,
+    "lora_r": 0,
+    "lora_alpha": 32,
+    "lora_dropout": 0.1,
+    "lora_targets": null,
+    "wandb": false,
+    "wandb_project": "tnm-staging",
+    "wandb_run_name": null,
+    "resume": null
+  },
+  "data": {
+    "train_samples": 6774,
+    "val_samples": 2279,
+    "valid_labels": {
+      "train": {
+        "t": 5853,
+        "n": 4826,
+        "m": 3916
+      },
+      "val": {
+        "t": 2271,
+        "n": 2001,
+        "m": 1658
+      }
+    }
+  },
+  "training": {
+    "updates_per_epoch": 847,
+    "total_steps": 6776,
+    "warmup_steps": 677,
+    "effective_batch_size": 8,
+    "best_f1_macro_avg": 0.9196400952801772,
+    "best_metrics": {
+      "f1_t": 0.9243097039625487,
+      "f1_n": 0.9498530879324032,
+      "f1_m": 0.8847574939455798,
+      "f1_macro_avg": 0.9196400952801772,
+      "exact_match": 0.8871621621621621,
+      "micro_f1": 0.9596542574293493,
+      "macro_precision": 0.946985611692174,
+      "macro_recall": 0.8996529301607653,
+      "n_valid_t": 2271,
+      "n_valid_n": 2001,
+      "n_valid_m": 1658
+    }
+  },
+  "run_metadata": {
+    "start_time": "2026-04-09T19:56:06.133857",
+    "end_time": "2026-04-11T07:17:17.104039",
+    "timestamp_dir": "20260409_1956",
+    "command": "/home/iih/SMM4H-HeaRD-2026-t6/.venv/bin/python3 src/train.py --data-dir data --output-dir outputs_large --encoder thomas-sounack/BioClinical-ModernBERT-large --max-length 4096 --head-type ce --batch-size 4 --grad-accum-steps 2 --epochs 8 --lr 2e-5 --warmup-ratio 0.1 --weight-decay 0.01",
+    "python_version": "3.12.12",
+    "platform": "Linux-6.14.0-1015-nvidia-aarch64-with-glibc2.39",
+    "pytorch_version": "2.9.0+cu130",
+    "cuda_version": "13.0",
+    "transformers_version": "4.57.6",
+    "device": "cuda",
+    "gpu_name": "NVIDIA GB10",
+    "git_commit": "a382a0d3eb1e3480058b6ba4785213c96b674bfd"
+  }
+}
