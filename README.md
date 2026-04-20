@@ -1,6 +1,6 @@
 # TNM Staging Classification from TCGA Pathology Reports
 
-trained checkpoint epoch_7 in output_large/ is on huggingface: https://huggingface.co/hsiaoeric/biocliniical-modernbert-tnm-staging
+trained checkpoint epoch_7 in outputs_large/ is on huggingface: https://huggingface.co/hsiaoeric/biocliniical-modernbert-tnm-staging
 
 Multi-label classification of T (T1–T4), N (N0–N3), and M (M0–M1) from free-text pathology reports, with optional explainability.
 
