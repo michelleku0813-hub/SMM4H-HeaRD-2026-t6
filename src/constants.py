@@ -17,7 +17,7 @@ N_NUM_LABELS = 4
 M_NUM_LABELS = 2
 
 # Default model
-DEFAULT_ENCODER = "thomas-sounack/BioClinical-ModernBERT-base"
+DEFAULT_ENCODER = "thomas-sounack/BioClinical-ModernBERT-large"
 DEFAULT_MAX_LENGTH = 4096
 
 # LoRA defaults

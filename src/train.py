@@ -1,6 +1,6 @@
 """
 Train TNM staging model: backbone encoder/decoder + three classification heads.
-Supports both CE (cross-entropy) and CORAL (ordinal regression) head types.
+Supports CE (cross-entropy), Focal Loss, and CORAL (ordinal regression) head types.
 """
 import argparse
 from datetime import datetime
@@ -56,8 +56,32 @@ def set_seed(seed: int):
 # Loss helpers
 # ---------------------------------------------------------------------------
 
+class FocalLoss(nn.Module):
+    """Multi-class focal loss: down-weights easy examples, focuses on hard ones.
+
+    FL(pt) = -alpha_t * (1 - pt)^gamma * log(pt)
+    """
+
+    def __init__(self, weight=None, gamma=2.0, label_smoothing=0.0, ignore_index=-1):
+        super().__init__()
+        self.gamma = gamma
+        self.label_smoothing = label_smoothing
+        self.ignore_index = ignore_index
+        self.register_buffer("weight", weight)
+
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(
+            logits, targets, weight=self.weight,
+            reduction="none", label_smoothing=self.label_smoothing,
+            ignore_index=self.ignore_index,
+        )
+        pt = torch.exp(-ce)
+        focal = ((1.0 - pt) ** self.gamma) * ce
+        return focal.mean()
+
+
 def masked_ce_loss(criterion, logits, labels, mask):
-    """CE loss only on valid samples."""
+    """CE/Focal loss only on valid samples."""
     if mask.any():
         return criterion(logits[mask], labels[mask])
     return torch.tensor(0.0, device=logits.device, requires_grad=True)
@@ -101,7 +125,7 @@ def binary_predict(logits):
 
 # ---------------------------------------------------------------------------
 # Metrics
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------`-----------
 
 def compute_metrics(pred_t, pred_n, pred_m, true_t, true_n, true_m,
                     mask_t=None, mask_n=None, mask_m=None):
@@ -393,11 +417,11 @@ def main():
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument("--encoder", default=DEFAULT_ENCODER)
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--eval-batch-size", type=int, default=32)
-    parser.add_argument("--grad-accum-steps", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--eval-batch-size", type=int, default=16)
+    parser.add_argument("--grad-accum-steps", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--head-lr", type=float, default=None,
                         help="Separate LR for classification heads (default: same as --lr)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -408,7 +432,14 @@ def main():
     # Head type
     parser.add_argument("--head-type", choices=["ce", "coral"], default="ce",
                         help="Classification head type: ce (cross-entropy) or coral (ordinal)")
-    parser.add_argument("--no-class-weights-m", action="store_true")
+    parser.add_argument("--focal-loss", action="store_true",
+                        help="Use Focal Loss instead of CE (only with --head-type ce)")
+    parser.add_argument("--focal-gamma", type=float, default=2.0,
+                        help="Focal loss gamma (focusing parameter)")
+    parser.add_argument("--label-smoothing", type=float, default=0.0,
+                        help="Label smoothing for CE/Focal loss (e.g. 0.1)")
+    parser.add_argument("--no-class-weights", action="store_true",
+                        help="Disable inverse-frequency class weights for all heads")
     # LoRA args (set --lora-r 0 to disable)
     parser.add_argument("--lora-r", type=int, default=0)
     parser.add_argument("--lora-alpha", type=int, default=DEFAULT_LORA_ALPHA)
@@ -469,21 +500,38 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0, pin_memory=False)
     val_loader = DataLoader(val_ds, batch_size=args.eval_batch_size, shuffle=False, num_workers=0)
 
-    # ---- Loss (CE mode only — CORAL computes loss inline) ----
+    # ---- Loss (CE/Focal mode — CORAL computes loss inline) ----
     criterion_t, criterion_n, criterion_m = None, None, None
     if args.head_type == "ce":
-        valid_m = train_df["m"].values
-        valid_m = valid_m[valid_m >= 0]
-        if not args.no_class_weights_m and len(valid_m) > 0:
-            m_counts = np.bincount(valid_m, minlength=M_NUM_LABELS)
-            m_weights = 1.0 / (m_counts + 1e-6)
-            m_weights = m_weights / m_weights.sum() * M_NUM_LABELS
-            weight_m = torch.tensor(m_weights, dtype=torch.float32).to(device)
+        def _inverse_freq_weights(labels, num_classes):
+            valid = labels[labels >= 0]
+            if len(valid) == 0:
+                return None
+            counts = np.bincount(valid, minlength=num_classes).astype(np.float64)
+            w = 1.0 / (counts + 1e-6)
+            w = w / w.sum() * num_classes
+            return torch.tensor(w, dtype=torch.float32).to(device)
+
+        weight_t = None if args.no_class_weights else _inverse_freq_weights(train_df["t"].values, T_NUM_LABELS)
+        weight_n = None if args.no_class_weights else _inverse_freq_weights(train_df["n"].values, N_NUM_LABELS)
+        weight_m = None if args.no_class_weights else _inverse_freq_weights(train_df["m"].values, M_NUM_LABELS)
+
+        if weight_t is not None:
+            logger.info("T class weights: %s", weight_t.cpu().tolist())
+        if weight_n is not None:
+            logger.info("N class weights: %s", weight_n.cpu().tolist())
+        if weight_m is not None:
+            logger.info("M class weights: %s", weight_m.cpu().tolist())
+
+        if args.focal_loss:
+            logger.info("Using Focal Loss (gamma=%.1f, label_smoothing=%.2f)", args.focal_gamma, args.label_smoothing)
+            criterion_t = FocalLoss(weight=weight_t, gamma=args.focal_gamma, label_smoothing=args.label_smoothing)
+            criterion_n = FocalLoss(weight=weight_n, gamma=args.focal_gamma, label_smoothing=args.label_smoothing)
+            criterion_m = FocalLoss(weight=weight_m, gamma=args.focal_gamma, label_smoothing=args.label_smoothing)
         else:
-            weight_m = None
-        criterion_t = nn.CrossEntropyLoss()
-        criterion_n = nn.CrossEntropyLoss()
-        criterion_m = nn.CrossEntropyLoss(weight=weight_m)
+            criterion_t = nn.CrossEntropyLoss(weight=weight_t, label_smoothing=args.label_smoothing)
+            criterion_n = nn.CrossEntropyLoss(weight=weight_n, label_smoothing=args.label_smoothing)
+            criterion_m = nn.CrossEntropyLoss(weight=weight_m, label_smoothing=args.label_smoothing)
 
     # ---- Model ----
     torch_dtype = torch.bfloat16 if args.lora_r > 0 else torch.float32
